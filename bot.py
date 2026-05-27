@@ -1,5 +1,7 @@
 import time
+import os
 import sqlite3
+import asyncio
 
 from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
@@ -8,20 +10,35 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 # SETTINGS
 # =========================
 
-TOKEN = "8034549979:AAHnXBLOdEUxL48rKsJRrKKfHFMQ7WxbmYA"
+TOKEN = os.getenv("TOKEN")
 ADMIN_ID = 7593435783
 
+if not TOKEN:
+    raise Exception("TOKEN missing in environment variables")
+
 # =========================
-# DATABASE
+# DB
 # =========================
 
 conn = sqlite3.connect("bot.db", check_same_thread=False)
 cursor = conn.cursor()
 
-cursor.execute("""CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY)""")
-cursor.execute("""CREATE TABLE IF NOT EXISTS balances(user_id INTEGER PRIMARY KEY, amount REAL)""")
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS investments(
+cursor.execute("""CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY,
+    ref_by INTEGER DEFAULT NULL
+)""")
+
+cursor.execute("""CREATE TABLE IF NOT EXISTS balances(
+    user_id INTEGER PRIMARY KEY,
+    amount REAL DEFAULT 0
+)""")
+
+cursor.execute("""CREATE TABLE IF NOT EXISTS referrals(
+    user_id INTEGER PRIMARY KEY,
+    referrals INTEGER DEFAULT 0
+)""")
+
+cursor.execute("""CREATE TABLE IF NOT EXISTS investments(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
     amount REAL,
@@ -29,8 +46,7 @@ CREATE TABLE IF NOT EXISTS investments(
     start_time INTEGER,
     duration INTEGER,
     status TEXT
-)
-""")
+)""")
 
 conn.commit()
 
@@ -73,15 +89,24 @@ def menu():
     )
 
 # =========================
-# START
+# START + REF SYSTEM
 # =========================
 
 async def start(update, context):
     uid = update.effective_user.id
+    args = context.args
 
-    cursor.execute("INSERT OR IGNORE INTO users VALUES(?)", (uid,))
+    ref = int(args[0]) if args else None
+
+    cursor.execute("INSERT OR IGNORE INTO users VALUES(?,?)", (uid, ref))
     cursor.execute("INSERT OR IGNORE INTO balances VALUES(?,0)", (uid,))
+    cursor.execute("INSERT OR IGNORE INTO referrals VALUES(?,0)", (uid,))
     conn.commit()
+
+    # referral reward (SAFE - only for signup)
+    if ref and ref != uid:
+        cursor.execute("UPDATE referrals SET referrals = referrals + 1 WHERE user_id=?", (ref,))
+        conn.commit()
 
     await update.message.reply_text("Welcome 🚀", reply_markup=menu())
 
@@ -102,12 +127,26 @@ async def buttons(update, context):
     elif text == "💳 Balance":
         await update.message.reply_text(f"Balance: ₦{b}")
 
+    elif text == "🏧 Withdraw":
+        if b < 200:
+            await update.message.reply_text("❌ Minimum withdrawal is ₦200")
+        else:
+            await update.message.reply_text("📩 Withdrawal request sent to admin for approval.")
+
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"New withdrawal request:\nUser: {uid}\nAmount: ₦{b}"
+            )
+
     elif text == "📊 Dashboard":
         cursor.execute("SELECT COUNT(*) FROM investments WHERE user_id=?", (uid,))
         inv = cursor.fetchone()[0]
 
+        cursor.execute("SELECT referrals FROM referrals WHERE user_id=?", (uid,))
+        ref = cursor.fetchone()[0]
+
         await update.message.reply_text(
-            f"Balance: ₦{b}\nInvestments: {inv}"
+            f"Balance: ₦{b}\nInvestments: {inv}\nReferrals: {ref}"
         )
 
     elif text == "📈 Invest":
@@ -116,10 +155,7 @@ async def buttons(update, context):
             [InlineKeyboardButton("Premium", callback_data="Premium")],
             [InlineKeyboardButton("VIP", callback_data="VIP")]
         ]
-        await update.message.reply_text(
-            "Choose Plan",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
+        await update.message.reply_text("Choose Plan", reply_markup=InlineKeyboardMarkup(kb))
 
 # =========================
 # CALLBACKS
@@ -137,10 +173,7 @@ async def cb(update, context):
             [InlineKeyboardButton(x[0], callback_data=f"buy_{q.data}_{i}")]
             for i, x in enumerate(PLANS[q.data])
         ]
-        await q.message.reply_text(
-            "Plans",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
+        await q.message.reply_text("Plans", reply_markup=InlineKeyboardMarkup(kb))
 
     elif q.data.startswith("buy_"):
         _, plan, i = q.data.split("_")
@@ -165,12 +198,10 @@ async def cb(update, context):
         await q.message.reply_text("✅ Investment started")
 
 # =========================
-# ENGINE (SAFE LOOP)
+# ENGINE
 # =========================
 
 def engine(app):
-    import asyncio
-
     async def loop():
         while True:
             await asyncio.sleep(30)
@@ -185,10 +216,7 @@ def engine(app):
             for inv_id, uid, profit, start, dur in rows:
                 if now >= start + dur:
 
-                    cursor.execute(
-                        "UPDATE investments SET status='done' WHERE id=?",
-                        (inv_id,)
-                    )
+                    cursor.execute("UPDATE investments SET status='done' WHERE id=?", (inv_id,))
                     conn.commit()
 
                     set_bal(uid, bal(uid) + profit)
@@ -201,17 +229,11 @@ def engine(app):
     return loop()
 
 # =========================
-# MAIN (FIXED CONNECTION SETTINGS)
+# MAIN
 # =========================
 
 def main():
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .build()
-    )
+    app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, buttons))
